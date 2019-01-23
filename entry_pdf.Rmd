@@ -1,0 +1,481 @@
+---
+title: "An Exploration of Player Speed in the National Football League"
+author: "Jim Kloet"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    fig_caption: yes
+    fig_crop: FALSE
+  html_document:
+    fig_caption: yes
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,
+                      message = FALSE,
+                      results = FALSE,
+                      warning = FALSE)
+```
+
+## Overview
+An ability to play at a high rate of speed is understood to be an important trait in players in the National Football League. However, a robust analysis has not yet been carried out to investigate the variability and importance of speed in actual NFL games. It is likely that a lack of availability of high quality speed measurement data provides at least some explanation for this gap.  
+
+Recently, the development of the NFL's Next Generation Statistics (NGS) makes it possible to measure speed with a high level of precision: in the current dataset, player and ball position are provided with precision to 0.1 yards, every 0.1 seconds. This level of precision enables player speed to be estimated, at scale, with a high level of accuracy.  
+
+The following report uses NGS Data to investigate meaningful sources of variability in speed in NFL games. Potential sources of variability should arise at the player-level (i.e. there are characteristics of players that lead some to be faster than others), the play-level, and at the game-level.
+
+## Data Summary
+
+```{r import data}
+# tidy environment
+rm(list = ls())
+
+# load functions
+lapply(list.files("/Users/jim/Documents/nfl-big-data-bowl-2019", pattern = "data.R$"), 
+       function(x) source(paste0("/Users/jim/Documents/nfl-big-data-bowl-2019/", x)))
+
+# libraries with functions that can't really be called directly
+library(data.table)
+
+# stitch together tracking data
+ngs_games <- dt_list[grepl("tracking", names(dt_list))]
+ngs_games <- data.table::rbindlist(ngs_games)
+dt_list <- dt_list[!grepl("tracking", names(dt_list))]
+# enrich
+ngs_games <- ngs_games[order(gameId, playId, nflId, frame.id)]
+ngs_games <- ngs_games[,
+                     `:=`(prev_x = data.table::shift(x = x, 1, type = "lag"),
+                          prev_y = data.table::shift(x = y, 1, type = "lag"),
+                          frame_diff = frame.id - data.table::shift(frame.id, 1, type = "lag")),
+                     by = .(nflId, playId)
+                     ][,
+                       calculated_dis := sqrt((x - prev_x)^2 + (y - prev_y)^2)
+                     ][,
+                       yards_per_second := (calculated_dis / frame_diff) * 10
+                     ][,
+                       yards_per_second_diff := yards_per_second - data.table::shift(yards_per_second, 1, type = "lag")
+                     ][,
+                       `:=`(miles_per_hour = yards_per_second * (3600 / 1760),
+                            miles_per_hour_diff = yards_per_second_diff * (3600 / 1760))]
+# add filtering columns for start/end of play
+event_list <- "kickoff|snap|out_of_bounds|touchback|incomplete|touchdown|sack|fair_catch|kneel|tackle|extra_point|field_goal|first_contact"
+event_onsets <- ngs_games[grepl(event_list, event),
+                          .(onset = min(frame.id, na.rm = TRUE),
+                            offset = max(frame.id, na.rm = TRUE)),
+                          by = .(playId)]
+ngs_games <- merge(ngs_games, event_onsets, by = "playId")
+```
+
+My initial analyses included a dataset with `r format(nrow(ngs_games), big.mark = ",")` rows of data, where each row represented a measurement of a player (or the football) in cartesian space with precision to 0.1, with each unit representing 1 linear yard (3 linear feet, approximately 0.914 meters); these measurements are updated every 0.1 seconds. These data were filtered to only include measurements between the start and end of each play, i.e. beginning with the snap or kickoff, and ending with a tackle, incomplete pass, touchdown, kick attempt, kneel, or player being forced out of bounds. In addition, instances where players purportedly moved at speeds greater than 23.35 miles per hour (the fastest recorded speed of a human at the time of writing) or at negative speeds were excluded from analyses; this accounted for less than 0.1% of all NGS data.
+
+The final set of data used in these analyses included `r format(length(unique(ngs_games$gameId)), big.mark = ",")` unique games, `r format(length(unique(ngs_games$playId)), big.mark = ",")` unique plays, and `r format(length(unique(ngs_games$nflId))-1, big.mark = ",")` unique players, all from the 2017 NFL season.  
+
+## Speed By Size
+It seems likely that bigger players are slower than smaller player. If this is not the case with the current data, additional cleansing is probably necessary until the expected pattern emerges. The following figure contains scatterplots and lines fitted from single degree of freedom linear models (i.e. correlations with intercept terms) for relationships between players' median speeds different ways to measure player sizer: panel (a) displays the relationship between speed and height in inches; panel (b) displays the relationship between speed and weight in pounds; and panel (c) displays the relationship between speed and body mass index (BMI), calculated as BMI = 703 * (weight in lbs. / height in inches^2^).
+
+``` {r plots speed by size,fig.height=3.5,fig.width=9,out.height='33%',out.width='100%',fig.cap="Scatterplots between player size and in-game speed\\; panel (a) presents relationship between height and speed\\; panel (b) presents relationship between weight and speed\\; panel (c) presents relationship between BMI and speed"}
+# break out players object, enrich for a player-position-speed breakdown
+players <- dt_list$players
+ngs_plus_players <- merge(ngs_games, 
+                          players,
+                          by = "nflId", 
+                          all.x = TRUE)
+ngs_plus_players <- ngs_plus_players[team != "ball"]
+plot_data <- ngs_plus_players[!is.na(miles_per_hour) &
+                                miles_per_hour >= 0 &
+                                miles_per_hour < 23.35 &
+                                frame.id >= onset &
+                                frame.id <= offset,
+                              .(height = max(Height, na.rm = TRUE),
+                                weight = max(Weight, na.rm = TRUE),
+                                median_miles_per_hour = median(miles_per_hour, na.rm = TRUE)),
+                              by = "nflId"]
+parsed_height <- strsplit(plot_data$height, split = "'")
+feet <- as.numeric(unlist(lapply(parsed_height, '[[', 1)))
+inches <- as.numeric(gsub("([0-9]+).*$", "\\1", unlist(lapply(parsed_height, '[[', 2))))
+plot_data$fixed_height <- (feet * 12) + inches
+corr_height <- ggplot2::ggplot(plot_data, ggplot2::aes(x = median_miles_per_hour, y = fixed_height)) +
+  ggplot2::geom_jitter(alpha = .3, size = .5, width = .1) +
+  ggplot2::geom_smooth(method = lm, color = "black", size = .6, linetype = "dashed") +
+  ggplot2::xlab(NULL) +
+  ggplot2::ylab("Height (in.)") +
+  ggplot2::ggtitle("(a)")
+corr_weight <- ggplot2::ggplot(plot_data, ggplot2::aes(x = median_miles_per_hour, y = weight)) +
+  ggplot2::geom_point(alpha = .3, size = .5) +
+  ggplot2::geom_smooth(method = lm, color = "black", size = .6, linetype = "dashed") +
+  ggplot2::xlab(NULL) +
+  ggplot2::ylab("Weight (lbs.)") +
+  ggplot2::ggtitle("(b)")
+plot_data$bmi <- 703 * (plot_data$weight / plot_data$fixed_height^2)
+corr_bmi <- ggplot2::ggplot(plot_data, ggplot2::aes(x = median_miles_per_hour, y = bmi)) +
+  ggplot2::geom_point(alpha = .3, size = .5) +
+  ggplot2::geom_smooth(method = lm, color = "black", size = .6, linetype = "dashed") +
+  ggplot2::xlab(NULL) +
+  ggplot2::ylab("BMI") +
+  ggplot2::ggtitle("(c)")
+gridExtra::grid.arrange(corr_height, corr_weight, corr_bmi, bottom = "Miles Per Hour", nrow = 1)
+```
+
+Across all three scatterplots, there are strong negative relationships between size and speed. This is the expected pattern, i.e. heavier/denser players move more slowly on the field than their lighter/less dense peers. Taller players tend to be heavier plays as well, which explains the negative relationship between height and speed.
+
+## Speed By Position
+There are likely additional sources of variability in speed beyond body measurements; one major source is likely to be across positions. Some positions require players to move faster than others, e.g. linemen (who are often responsible for engaging with players who are moving toward them) likely don't need to move as fast as skill players (who are often chasing ball carriers or running away from potential tacklers) in order to accomplish their jobs on a given play.  
+
+The next figure presents distributions of speed by position, for all position groups that encompassed at least 1% of the frames in the sample (i.e. excluding the positions of undifferentiated DB and LB) across all scrimmage plays in the sample (i.e. excluding special teams plays); panel (a) displays frame-level distributions of in-game player speeds (i.e. each observation is a player's speed measured every 0.1 seconds) pivoted by positions; the medians for each position group are labeled and indicated with a vertical black line.  Panel (b) is a slight reformulation of (a), as it displays the distributions of the _maximum_ speeds attained by the position groups across plays. 
+
+``` {r plots speed by position,fig.height=6,fig.width=10,out.height='50%',out.width='85%',fig.fullwidth=TRUE,fig.cap="Distributions of speed by position\\; panel (a) presents frame-level distributions of player speed by position\\; panel (b) presents play-level distributions of maximum speeds by position"}
+# prep data for plotting distributions of frames
+plot_data <- ngs_plus_players[team != "ball" &
+                                !(PositionAbbr %in% c("P", "K", "LS", "DB", "LB")) &
+                                !is.na(miles_per_hour) &
+                                miles_per_hour >= 0 &
+                                miles_per_hour < 23.35 &
+                                frame.id >= onset &
+                                frame.id <= offset,
+                              list(nflId,
+                                   gameId,
+                                   playId,
+                                   frame.id,
+                                   PositionAbbr, 
+                                   miles_per_hour,
+                                   event)]
+# make the factor for ordering plots
+pos_factor_dt <- plot_data[,
+                           .(median_miles_per_hour = median(miles_per_hour, na.rm = TRUE)),
+                           .(PositionAbbr)][order(median_miles_per_hour)]
+pos_factor_levels <- as.character(pos_factor_dt$PositionAbbr)
+plot_data$pos_factor <- factor(plot_data$PositionAbbr, levels = pos_factor_levels)
+# make a ridgeplot
+fig_a <- ggplot2::ggplot(plot_data, ggplot2::aes(x = miles_per_hour, y = pos_factor)) +
+  ggridges::stat_density_ridges(quantile_lines = TRUE, quantiles = 2, size = .5, alpha = .6) +
+  ggstance::stat_summaryh(ggplot2::aes(label = sprintf("%1.2f", ..x..)),
+                          fun.x = median, 
+                          geom = "text",
+                          size = 4,
+                          position = ggplot2::position_nudge(x = 2.5, y = .45)) +
+  ggplot2::coord_cartesian(clip = "off") +
+  ggplot2::xlab(NULL) +
+  ggplot2::ylab(NULL) +
+  ggplot2::ggtitle("(a)") +
+  ggplot2::theme_minimal()
+# update data for new plot
+plot_data <- plot_data[,
+                       .(max_miles_per_hour = max(miles_per_hour, na.rm = TRUE)),
+                       by = .(gameId, playId, pos_factor)]
+fig_b <- ggplot2::ggplot(plot_data, ggplot2::aes(x = max_miles_per_hour, y = pos_factor)) +
+  ggridges::stat_density_ridges(quantile_lines = TRUE, quantiles = 2, size = .5, alpha = .6) +
+  ggstance::stat_summaryh(ggplot2::aes(label = sprintf("%1.2f", ..x..)),
+                          fun.x = median, 
+                          geom = "text",
+                          size = 4,
+                          position = ggplot2::position_nudge(x = 2.5, y = .45)) +
+  ggplot2::coord_cartesian(clip = "off") +
+  ggplot2::xlab(NULL) +
+  ggplot2::ylab(NULL) +
+  ggplot2::ggtitle("(b)") +
+  ggplot2::theme_minimal()
+
+gridExtra::grid.arrange(fig_a, fig_b, ncol = 2, bottom = "Miles Per Hour")
+```
+
+The position distributions in panel (a) appear to be bimodal, with the first peak near 0 mph across positions, and the second peak occurring between 3 and 10 mph.  Unsurprisingly, WRs, RBs, and DBs are at the top of the list (speed is necessary for these positions to be successful on most plays, and these position groups often run at top speed during gameplay), and interior linemen are near the bottom (speed is less important for these groups than other traits). The fact that QBs are at the bottom of the list reflects their role on most plays - handing off the ball, or moving deliberately in the pocket to loocate a receiver, neither of which require a high rate of speed to achieve success in most cases. 
+
+Two major difference are apparent in panel (b): first, the peaks near 0 mph disappear, which is expected since we're focusing on top speeds; second, QBs are no longer at the bottom of the list, suggesting that they have the ability to move faster than the frame-level analysis would suggest.
+
+## Speed By Play Type
+
+At this point, variability in in-game player speeds has been observed across player size and across positions, i.e. factors related specifically to the player. In addition to these factors, it is likely that there are play-level factors that impact player speed. One of these factors is the type of play. Not all plays require players to move at high rates of speed. For instance, plays with the goal of gaining short yardage may not afford enough time for players to accelerate to a fast speed.  
+
+The next figure summarizes player speeds across the following types of plays: rushes, passes, punts, and kickoffs. These analyses include the same set of skill position players as in the previous analyses. Field goals and extra points were omitted here due to the fact that players don't generally have to run downfield on these plays. In addition, these analyses focus exclusively on offensive skill-position players (RB, TE, WR; I'm excluding FB and QB because they're not necessarily supposed to be fast in the same way as the other position groups) and defensive backs (CB, FS, SS), as the position groups who are most likely to be selected on the basis of speed.
+
+``` {r speed by playtype,fig.height=3,fig.width=5,out.height='30%',out.width='100%',fig.cap="Distributions of player speed by play types"}
+filtered_plays <- dt_list$plays
+filtered_plays <- filtered_plays[SpecialTeamsPlayType %in% c(NA, "Kickoff", "Punt"),
+                                .(gameId,
+                                  playId,
+                                  playtype = ifelse(!is.na(SpecialTeamsPlayType), 
+                                                     SpecialTeamsPlayType,
+                                                    ifelse(!is.na(PassResult),
+                                                           "Pass", "Rush")))]
+filtered_plays$playtype <- factor(filtered_plays$playtype, levels = c("Kickoff", "Punt", "Pass", "Rush"))
+plot_data <- ngs_plus_players[team != "ball" &
+                                PositionAbbr %in% c("RB", "TE", "WR", "CB", "FS", "SS", "DB") &
+                                !is.na(miles_per_hour) &
+                                miles_per_hour >= 0 &
+                                miles_per_hour < 23.35 &
+                                frame.id >= onset &
+                                frame.id <= offset]
+plot_data <- merge(filtered_plays, plot_data, all.x = TRUE, by = c("gameId", "playId"))
+boxplots <- ggplot2::ggplot(plot_data, ggplot2::aes(x = playtype, y = miles_per_hour)) +
+  ggplot2::geom_boxplot(outlier.shape = NA, fill = NA) +
+  ggplot2::xlab(NULL) +
+  ggplot2::ylab("Miles Per Hour") +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(panel.grid = ggplot2::element_blank())
+boxplots
+
+```
+
+The boxplots display summaries, by play type, of the frame-level player speed data; the ends of the lines at the top and bottom of each box represent the maximum and minimum speeds, respectively; the lines in the box represent quartiles. This figure suggests that skill position players are moving significantly faster on kickoffs and punts than on passes and rushes. On these plays, players have substantial opportunity, and expectation, to accelerate to a high speed, especially players on the kicking teams. There should be more variability on passes and and rushes, but there's more opportunity for acceleration on passing plays, where multiple WRs can run downfield on a play (often with the DBs that are covering them), which is not the case with rushing plays.  
+
+## Speed By Team
+
+It is plausible that some teams place more value on speed than others, and so we would expect these teams to have faster players than other teams, either as a result of deliberate roster construction (e.g. drafting or trading for players who are fast) or through coaching methods that increase player speed (e.g. speed training or nutrition training to reduce weight). The next figure contains breakdowns of player speed by team, specifically, the first quartile (lower bound), median, and third quartile (upper bound) of in-game speeds for the players in the sample. Panel (a) includes all skill position players on a team, and is the sort order for the teams; panel (b) includes only offensive skills players on a team; and panel (c) includes all defensive skill players on a team.  
+
+``` {r speed by team,fig.height=5,fig.width=7,out.height='50%',out.width='85%',fig.fullwidth=TRUE,fig.cap="Median speed of skill position players by team\\; panel (a) is all skill position players\\; panel (b) is offensive skill position players\\; panel (c) is defensive skill position players"}
+# overall plot
+plot_data <- ngs_plus_players[team != "ball" &
+                                PositionAbbr %in% c("RB", "TE", "WR", "CB", "FS", "SS", "DB") &
+                                !is.na(miles_per_hour) &
+                                miles_per_hour >= 0 &
+                                miles_per_hour < 23.35 &
+                                frame.id >= onset &
+                                frame.id <= offset,
+                              list(gameId,
+                                   team,
+                                   PositionAbbr,
+                                   miles_per_hour)]
+plot_data <- merge(plot_data, dt_list$games, by = "gameId")
+plot_data <- plot_data[,
+                       list(team,
+                            PositionAbbr,
+                            homeTeamAbbr,
+                            visitorTeamAbbr,
+                            miles_per_hour)]
+plot_data$fixed_team <- ifelse(plot_data$team == "home", 
+                               plot_data$homeTeamAbbr, 
+                               plot_data$visitorTeamAbbr)
+plot_data <- plot_data[,
+                       .(q1_mph = quantile(miles_per_hour, .25, na.rm = TRUE),
+                         median_miles_per_hour = median(miles_per_hour, na.rm = TRUE),
+                         q3_mph = quantile(miles_per_hour, .75, na.rm = TRUE),
+                         obs = .N),
+                       by = .(fixed_team)]
+plot_data <- plot_data[order(median_miles_per_hour)]
+sorted_levels <- as.character(plot_data$fixed_team)
+plot_data$fixed_team <- factor(plot_data$fixed_team, levels = sorted_levels)
+fig_a <- ggplot2::ggplot(data = plot_data, ggplot2::aes(x = fixed_team, y = median_miles_per_hour)) +
+  ggplot2::geom_point(size = 1) +
+  ggplot2::geom_errorbar(ggplot2::aes(ymin = q1_mph, ymax = q3_mph),
+                         alpha = .5, size = .5, width = .5) +
+  ggplot2::coord_flip(ylim = c(0, 15)) +
+  ggplot2::ggtitle("(a)") +
+  ggplot2::xlab(NULL) +
+  ggplot2::ylab(NULL)
+# offense and defense plots
+plot_data <- ngs_plus_players[team != "ball" &
+                                PositionAbbr %in% c("RB", "TE", "WR", "CB", "FS", "SS", "DB") &
+                                !is.na(miles_per_hour) &
+                                miles_per_hour >= 0 &
+                                miles_per_hour < 23.35 &
+                                frame.id >= onset &
+                                frame.id <= offset,
+                              list(gameId,
+                                   team,
+                                   PositionAbbr,
+                                   miles_per_hour)]
+plot_data$off_def <- ifelse(plot_data$PositionAbbr %in% c("RB", "TE", "WR"), "off", "def")
+plot_data <- merge(plot_data, dt_list$games, by = "gameId")
+plot_data <- plot_data[,
+                       list(team,
+                            PositionAbbr,
+                            homeTeamAbbr,
+                            visitorTeamAbbr,
+                            miles_per_hour,
+                            off_def)]
+plot_data$fixed_team <- ifelse(plot_data$team == "home", 
+                               plot_data$homeTeamAbbr, 
+                               plot_data$visitorTeamAbbr)
+plot_data <- plot_data[,
+                       .(q1_mph = quantile(miles_per_hour, .25, na.rm = TRUE),
+                         median_miles_per_hour = median(miles_per_hour, na.rm = TRUE),
+                         q3_mph = quantile(miles_per_hour, .75, na.rm = TRUE),
+                         obs = .N),
+                       by = .(fixed_team, off_def)]
+
+off_plot_data <- plot_data[off_def == "off",
+                           .(ordered_tm = factor(fixed_team, levels = sorted_levels),
+                             off_def,
+                             median_miles_per_hour,
+                             q1_mph,
+                             q3_mph)]
+fig_b <- ggplot2::ggplot(data = off_plot_data, ggplot2::aes(x = ordered_tm, y = median_miles_per_hour)) +
+  ggplot2::geom_point(size = 1) +
+  ggplot2::geom_errorbar(ggplot2::aes(ymin = q1_mph, ymax = q3_mph),
+                         alpha = .5, size = .5, width = .5) +
+  ggplot2::coord_flip(ylim = c(0, 15)) +
+  ggplot2::ggtitle("(b)") +
+  ggplot2::xlab(NULL) +
+  ggplot2::ylab(NULL)
+
+def_plot_data <- plot_data[off_def == "def",
+                           .(ordered_tm = factor(fixed_team, levels = sorted_levels),
+                             off_def,
+                             median_miles_per_hour,
+                             q1_mph,
+                             q3_mph)]
+fig_c <- ggplot2::ggplot(data = def_plot_data, ggplot2::aes(x = ordered_tm, y = median_miles_per_hour)) +
+  ggplot2::geom_point(size = 1) +
+  ggplot2::geom_errorbar(ggplot2::aes(ymin = q1_mph, ymax = q3_mph),
+                         alpha = .5, size = .5, width = .5) +
+  ggplot2::coord_flip(ylim = c(0, 15)) +
+  ggplot2::ggtitle("(c)") +
+  ggplot2::xlab(NULL) +
+  ggplot2::ylab(NULL)
+
+gridExtra::grid.arrange(fig_a, fig_b, fig_c, nrow = 1, bottom = "Miles Per Hour")
+```
+
+A couple things stand out here. First, there does appear to be variability in skill-player speed across teams, but there aren't any teams who immediately stand out (on visual inspection) as exceptionally faster or exceptionally slower than the rest of the league. This seems to be true across all three panels, as median scores ranged from 6.354 miles per hour to 8.515 miles per hour.  
+
+Second, the fastest teams, in terms of in-game player speeds, were a little surprising - the Cleveland Browns have the highest median speed across all skill players, followed by the Buffalo Bills and the Seattle Seahawks. This struck me as peculiar given that speed is supposed to be a trait associated with positive outcomes, but the Browns and Bills had two of the worst records in the league in the 2017 season. It is possible that the reason these poor-performing teams are near the top of the list in player speed is because those teams were playing from behind (i.e. had fewer points than their opponents) more frequently than other teams; in an attempt to play catch-up, the poorer performing teams would be forced to throw more passes throughout the game, which plausibly require players to run faster than the types of short running plays frequently employed by teams who are trying to protect a lead on the scoreboard.  
+
+## Speed By Playing Conditions
+
+Beyond player and play factors, game-level factors (i.e. factors associated with particular games, rather than players or plays) should also have an impact on player speed. Playing conditions, i.e. the playing surface and weather surrounding a game, is a strong candidate for a game-level factor which impacts speed. Playing surfaces are not homogenous across NFL stadiums, and can be comprised of natural grass or synthetic materials. This next analysis explores player speed across playing surfaces. The following figure shows the median speeds of skill position players, plus-minus the SEM, for the various types of playing surfaces.  
+
+``` {r speed by surface,fig.height=5,fig.width=7,out.height='30%',out.width='100%',fig.cap="Median in-game speed +/- SEM, skill position players, by type of playing surface"}
+conditions <- dt_list$games
+conditions <- conditions[,
+                         .(gameId,
+                           temp = as.numeric(Temperature),
+                           hum = as.numeric(Humidity),
+                           wind = as.numeric(WindSpeed),
+                           GameWeather,
+                           StadiumType,
+                           fixed_surface = ifelse(grepl("grass$|natural", tolower(Turf)), 
+                                              "grass", 
+                                           ifelse(grepl("ubu", tolower(Turf)),
+                                              "ubu s5-m",
+                                           ifelse(grepl("fieldturf|field turf", tolower(Turf)),
+                                              "fieldturf", tolower(Turf)))))]
+plot_data <- ngs_plus_players[team != "ball" &
+                                PositionAbbr %in% c("RB", "TE", "WR", "CB", "FS", "SS", "DB") &
+                                !is.na(miles_per_hour) &
+                                miles_per_hour >= 0 &
+                                miles_per_hour < 23.35 &
+                                frame.id >= onset &
+                                frame.id <= offset,
+                              list(gameId,
+                                   miles_per_hour)]
+plot_data <- merge(conditions, plot_data, by = "gameId")
+factor_order <- plot_data[,
+                       .(q2 = quantile(miles_per_hour, .5, na.rm = TRUE),
+                         SEM = sd(miles_per_hour, na.rm = TRUE) / sqrt(.N)),
+                       by = .(fixed_surface)]
+factor_order <- factor_order[order(-q2)]
+factor_order$surface_factor <- factor(factor_order$fixed_surface, levels = as.character(factor_order$fixed_surface))
+ggplot2::ggplot(data = factor_order, ggplot2::aes(x = surface_factor, y = q2)) +
+  ggplot2::geom_point(size = 2) +
+  ggplot2::geom_errorbar(ggplot2::aes(ymin = q2 - SEM, ymax = q2 + SEM), width = .3) +
+  ggplot2::xlab(NULL) +
+  ggplot2::ylab("Miles Per Hour") +
+  ggplot2::theme_minimal()
+```
+
+Speed appears to vary across playing surfaces. The median speed of skill position players on A-Turf Titan was 7.57 miles per hour, which was approximately 0.2 miles per hour faster than the runner-up (UBU Speed S5-M, 7.37 miles per hour). On the other side of the graph, the median speed of skill position players was slowest on natural grass, at 7.19 miles per hour. This aligns with a common perception that players are faster on artifical turf than on natural grass.
+
+The next plots present relationships between weather (i.e. temperature, humidity, and wind speed) and skill position player speed. In this case, because weather is a game-level phenomenon, the speed metric here is a player's median speed in a game, i.e. each dot in the scatterplots represents a specific player's median speed in a specific game.
+
+``` {r speed by weather,fig.height=4,fig.width=12,out.height='30%',out.width='100%',fig.cap="Relationships between weather and player median speeds, by game; panel (a) is the relationship between speed and air temperature; panel (b) is the relationship between speed and air humidity; panel (c) is the relationship between speed and wind speed"}
+plot_data <- ngs_plus_players[team != "ball" &
+                                PositionAbbr %in% c("RB", "TE", "WR", "CB", "FS", "SS", "DB") &
+                                !is.na(miles_per_hour) &
+                                miles_per_hour >= 0 &
+                                miles_per_hour < 23.35 &
+                                frame.id >= onset &
+                                frame.id <= offset,
+                              list(nflId,
+                                   gameId,
+                                   miles_per_hour)]
+plot_data <- merge(conditions, plot_data, by = "gameId")
+plot_data <- plot_data[,
+                       .(temp = max(temp, na.rm = TRUE),
+                         hum = max(hum, na.rm = TRUE),
+                         wind = max(wind, na.rm = TRUE),
+                         median_speed = median(miles_per_hour, na.rm = TRUE)),
+                       by = .(nflId, gameId)]
+fig_a <- ggplot2::ggplot(plot_data, ggplot2::aes(x = temp, y = median_speed)) +
+  ggplot2::geom_jitter(alpha = .3, size = .5, width = .1) +
+  ggplot2::geom_smooth(method = lm, color = "black", size = .6, linetype = "dashed") +
+  ggplot2::xlab("Temperature") +
+  ggplot2::ylab(NULL) +
+  ggplot2::ggtitle("(a)")
+fig_b <- ggplot2::ggplot(plot_data, ggplot2::aes(x = hum, y = median_speed)) +
+  ggplot2::geom_jitter(alpha = .3, size = .5, width = .1) +
+  ggplot2::geom_smooth(method = lm, color = "black", size = .6, linetype = "dashed") +
+  ggplot2::xlab("Humidity") +
+  ggplot2::ylab(NULL) +
+  ggplot2::ggtitle("(b)")
+fig_c <- ggplot2::ggplot(plot_data, ggplot2::aes(x = wind, y = median_speed)) +
+  ggplot2::geom_jitter(alpha = .3, size = .5, width = .1) +
+  ggplot2::geom_smooth(method = lm, color = "black", size = .6, linetype = "dashed") +
+  ggplot2::xlab("Wind Speed") +
+  ggplot2::ylab(NULL) +
+  ggplot2::ggtitle("(c)")
+gridExtra::grid.arrange(fig_a, fig_b, fig_c, ncol = 3)
+```
+
+Inspecting the scatterplots, it does not appear that there are significant relationships between player speed and the weather metrics in the present data set. It is plausible that this is true - the ranges of temperature, humidity, and wind speed are not espexcially wide, and players and coaches may not make particular adjustments for different temperatures, humidities, or wind speeds. It is also plausible that the game-level measurements of weather are obfuscating more meaningful variability in weather; for instance, wind speed changes frequently over time, so play-level measurements might reveal a more meaningful relationship between wind speed and player speed. Finally, there were a limited number of games with references to precipitation in the sample (n = 3 out of 91), making it impossible to assess the relationship between precipitation and player speed. It is certainly likely that precipitation has a significant impact on player speed, as it doubtless impacts traction.
+
+## Speed By Fatigue
+
+Player fatigue should have some impact on how fast they move on the field. While there are no player-reported or other directly measured data on fatigue available in the current sample, fatigue can be estimated several ways, e.g. time spent on field, elapsed game time, or total distance covered. The three methodologies just mentioned all assume that fatigue is purely additive, which isn't necessarily true.  
+
+The next figure presents the relationship between speed, specifically the maximum speed attained on a given play, and one measure of fatigue, i.e. the cumulative distance (in yards) a player covered in a game prior to that play.  
+
+``` {r speed by fatigue,fig.height=7,fig.width=10,out.height='40%',out.width='80%',fig.fullwidth=TRUE,fig.cap="Relationship between player speed and fatigue; speed is operationally defined as the maximum speed attained on play n, and fatigue is operationally defined as the total distance in yards covered by the player prior to play n; each point represents a player-play; dashed line represents lineear line of best fit"}
+plot_data <- ngs_plus_players[team != "ball" &
+                                PositionAbbr %in% c("RB", "TE", "WR", "CB", "FS", "SS", "DB") &
+                                !is.na(miles_per_hour) &
+                                miles_per_hour >= 0 &
+                                miles_per_hour < 23.35 &
+                                frame.id >= onset &
+                                frame.id <= offset,
+                              list(nflId,
+                                   gameId,
+                                   playId,
+                                   dis,
+                                   miles_per_hour)]
+plot_data <- plot_data[,
+                       .(total_dis = sum(dis, na.rm = TRUE),
+                         max_speed = max(miles_per_hour, na.rm = TRUE)),
+                       by = .(nflId, gameId, playId)]
+plot_data <- plot_data[order(nflId, gameId, playId),
+                       cumulative_dis := cumsum(total_dis),
+                       by = .(nflId, gameId)]
+plot_data <- plot_data[cumulative_dis <= quantile(cumulative_dis, .99) & max_speed > 0]
+ggplot2::ggplot(data = plot_data, ggplot2::aes(x = cumulative_dis, y = max_speed)) +
+  ggplot2::geom_point(alpha = .05, size = .1) +
+  ggplot2::geom_smooth(color = "black", linetype = "dashed", size = 1.5) +
+  ggplot2::xlab("Yards") +
+  ggplot2::ylab("Miles Per Hour") +
+  ggplot2::theme_minimal()
+```
+
+Based on this figure, it looks like there is an exceedingly small negative relationship between fatigue and player speed, such that players who have traveled longer distances in games have slightly lower top speeds on subsequent plays. However, the correlation (Pearson's _r_  = `r round(cor(plot_data$cumulative_dis, plot_data$max_speed), 3)`) is awfully close to zero.  
+There are several possible explanations for this slightly counterintuitive finding. The simplest explanation is that skill players are world-class athletes who are capable of fully exerting themselves throughout the duration of an NFL game. Indeed, given that few players are moving more than `r max(plot_data$cumulative_dis)` yards over the course of the game (less than one mile), it seems likely that NFL skill position players would be able to maintain a high top speed until the end of the game.  
+
+Another potential explanation is that the relationship between speed and fatigue is somehow moderated by another factor, for instance, gamescript (difference in score between a player's team and the opposing team). Future investigations should explore this in greater detail.
+
+## Summary And Next Steps
+
+The NGS data is a rich source of information about player movements in NFL games, and enables researchers to investigate questions about player speed in significantly greater detail than was previously possible. The current report attempted to summarise in-game player speed across a number of dimensions, as well as explore relationships between player speed and other performance metrics.  
+
+This report supported a number of points that seem fairly obvious, but which nonetheless should be explored and validated given the currernt dearth of research in this area:  
+
+* Smaller players move faster in games than bigger players.  
+* Skill position players move faster than non-skill position players.  
+* Players move faster when they are enabled (e.g. via opportunity to run unimpeded for more than a fraction of a second, playing on artificial turf, or playing in favorable weather conditions) or required (e.g. on kickoffs and punts, or when running long passing routes) to do so.  
+
+The analyses in this report also returned some findings that weren't exactly as expected, but which have plausible explanations:  
+
+* The teams with the fastest skill-position players often had poor records. One plausible explanation for this is that poorer teams are often behind in the score, which forces them to run fewer rushing plays (which tend to elicit the slowest speeds out of all play types, and can also reflect a greater number of punts (punt coverage players move faster than punt return players).  
+* Fatigue doesn't appear to have a major impact on skill player speed in games - as players accrue more total yardage through the course of a game, their top speeds on subsequent plays don't appear to be diminished. A plausible explanation for this is that skill players are specifically conditioned to be able to reach high speeds throughout the duration of NFL football games. It's also plausible that the kind of fatigue players experience isn't adequately captured by measuring speed; for instance, players may suffer more fatigue of their upper bodies than lower bodies throughout the game, in which case we might expect some players to have more difficulty separating from their opponents (like WRs separating from CBs) ove time.  
+
+There are obviously many questions that this report left unanswered, or did not even ask. Here are some additional directions and ideas for further investigations:  
+
+* Future investigations should identify a singular metric and level of aggregation to characterize game speed. While distributions provide essential context to any kind of exploratory data analysis, and different insights can be gleaned from different levels of aggregation (i.e. player-level speed, game-level speed, play-level speed, frame-level speed), in this report the constant switching was probably more confusing than informative. Still, the distributional data suggests that the mean may not be the best measurement of central tendency to use when reporting on speed in NFL games; the median is a more appropriate measurement of central tendency here.  
+* None of the analyses in the present report consider interactions between factors impacting speed. For instance, it is plausible that the speeds of heavier players are more impacted by changes in humidity or temperature than the speed of lighter weight players. Future investigations should identify more hypotheses around potential interactions between factors which impact player speed, as these are likely the most fertile grounds for new insights to be uncovered.  
+* None of the analyses in the present report consider the impact of covariates. For instance, it is likely that the relationship between speed and estimates of fatigue like elapsed time are moderated to an extent by gamescript (the difference between a team's score and the opponent's score), such that players on teams with positive gamescripts will be less impacted by fatigue due to conservative play-calling as the game progresses. Future investigations might consider statistically controlling for these covariates using techniques like multiple linear regression.  
